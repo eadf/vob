@@ -585,6 +585,56 @@ impl<T: Debug + PrimInt> Vob<T> {
         }
     }
 
+    /// Counts the number of set bits.
+    /// This method assumes the range is processed with process_range()
+    fn _count_set_bits(&self, range: Range<usize>) -> usize {
+        // Early return for empty ranges
+        if range.start >= range.end {
+            return 0;
+        }
+        let start_word = block_offset::<T>(range.start);
+        if start_word >= self.len {
+            return 0;
+        }
+        // this -1 is safe since we already tested for range.start & range.end equality
+        let end_word = blocks_required::<T>(range.end) - 1;
+
+        if start_word == end_word {
+            // Range entirely within one word
+            let word = self.vec[start_word];
+            let start_bit = range.start % bits_per_block::<T>();
+            let end_bit = range.end % bits_per_block::<T>();
+
+            // Remove bits before start_bit and bits after end_bit
+            return count_ones_usize(if end_bit == 0 {
+                // end_bit = 0 means we want everything from start_bit to end of word
+                // After the right shift above, we already have what we want
+                word >> start_bit
+            } else {
+                // We want bits from start_bit to end_bit
+                // After right shift, we need to remove the high bits
+                (word >> start_bit) << (start_bit + bits_per_block::<T>() - end_bit)
+            });
+        }
+
+        // First word: shift out bits before start_bit
+        let start_bit = range.start % bits_per_block::<T>();
+        let mut count = count_ones_usize(self.vec[start_word] >> start_bit);
+
+        // Middle words (unchanged)
+        for word_idx in (start_word + 1)..end_word {
+            count += count_ones_usize(self.vec[word_idx]);
+        }
+
+        // Last word: shift out bits after end_bit
+        let end_bit = range.end % bits_per_block::<T>();
+        if end_bit == 0 {
+            count + count_ones_usize(self.vec[end_word])
+        } else {
+            count + count_ones_usize(self.vec[end_word] << (bits_per_block::<T>() - end_bit))
+        }
+    }
+
     /// Returns an iterator which efficiently produces the index of each unset bit in the specified
     /// range. Assuming appropriate support from your CPU, this is much more efficient than
     /// checking each bit individually.
@@ -1082,6 +1132,10 @@ impl<T: Debug + PrimInt> Iterator for Iter<'_, T> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.range.size_hint()
     }
+
+    fn count(self) -> usize {
+        self.range.count()
+    }
 }
 
 impl<T: Debug + PrimInt> DoubleEndedIterator for Iter<'_, T> {
@@ -1147,6 +1201,10 @@ impl<T: Debug + PrimInt> Iterator for IterSetBits<'_, T> {
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.range.size_hint()
+    }
+
+    fn count(self) -> usize {
+        self.vob._count_set_bits(self.range)
     }
 }
 
@@ -1228,6 +1286,10 @@ impl<T: Debug + PrimInt> Iterator for IterUnsetBits<'_, T> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.range.size_hint()
     }
+
+    fn count(self) -> usize {
+        (self.range.end - self.range.start) - self.vob._count_set_bits(self.range)
+    }
 }
 
 impl<T: Debug + PrimInt> DoubleEndedIterator for IterUnsetBits<'_, T> {
@@ -1300,6 +1362,10 @@ impl<T: Debug + PrimInt> Iterator for StorageIter<'_, T> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.iter.size_hint()
     }
+
+    fn count(self) -> usize {
+        self.iter.count()
+    }
 }
 
 #[inline(always)]
@@ -1328,6 +1394,14 @@ fn blocks_required<T>(num_bits: usize) -> usize {
         } else {
             1
         }
+}
+
+/// Convenience function that calls T::count_ones() and converts the result to usize
+/// (The conversion is always safe even if T is u128 and usize is u16)
+#[inline(always)]
+fn count_ones_usize<T: PrimInt>(value: T) -> usize {
+    use std::convert::TryFrom;
+    usize::try_from(value.count_ones()).unwrap()
 }
 
 #[macro_export]
@@ -1977,6 +2051,26 @@ mod tests {
         for _ in 0..len {
             vob.push(rng.random());
         }
+        assert_eq!(
+            vob.iter_set_bits(..).count(),
+            vob.iter_set_bits(..).filter(|_| true).count()
+        );
+        assert_eq!(
+            vob.iter_unset_bits(..).count(),
+            vob.iter_unset_bits(..).filter(|_| true).count()
+        );
+        if len > 2 {
+            // trigger the edge cases of _count_set_bits()
+            let range = 1..len - 1;
+            assert_eq!(
+                vob.iter_set_bits(range.clone()).count(),
+                vob.iter_set_bits(range.clone()).filter(|_| true).count()
+            );
+            assert_eq!(
+                vob.iter_unset_bits(range.clone()).count(),
+                vob.iter_unset_bits(range.clone()).filter(|_| true).count()
+            );
+        }
         vob
     }
 
@@ -2049,5 +2143,29 @@ mod tests {
         v.pop();
         v.push(true);
         assert_eq!(v.vec.len(), 1);
+    }
+
+    #[test]
+    fn test_count() {
+        let mut rng = rand::rng();
+
+        for test_len in 1..128 {
+            let vob = random_vob(test_len);
+            for i in 1..test_len - 1 {
+                let from = rng.random_range(0..i);
+                if from == i {
+                    continue;
+                }
+                let to = rng.random_range(from..i);
+                assert_eq!(
+                    vob.iter_set_bits(from..to).count(),
+                    vob.iter_set_bits(from..to).filter(|_| true).count()
+                );
+                assert_eq!(
+                    vob.iter_unset_bits(from..to).count(),
+                    vob.iter_unset_bits(from..to).filter(|_| true).count()
+                );
+            }
+        }
     }
 }
